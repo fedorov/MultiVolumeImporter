@@ -1,6 +1,7 @@
 import os
 import string
 import vtk, qt, ctk, slicer
+import vtk.util.numpy_support
 import DICOMLib
 from DICOMLib import DICOMPlugin
 from DICOMLib import DICOMLoadable
@@ -66,6 +67,8 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     """ Returns a list of DICOMLoadable instances
     corresponding to ways of interpreting the
     fileLists parameter.
+
+    Top-level examine() calls various individual strategies implemented in examineFiles*().
     """
     loadables = []
     allfiles = []
@@ -77,9 +80,18 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     # individual frames should be parsed from series
     loadables += self.examineFilesMultiseries(allfiles)
 
+    # this strategy sorts the files into groups
+    loadables += self.examineFilesIPPAcqTime(allfiles)
+
     return loadables
 
+
   def examineFilesMultiseries(self,files):
+    """
+    This strategy is similar to examineFiles(), but
+    does not separate the files by individual series before
+    parsing multivolumes out.
+    """
 
     logging.debug('MultiVolumeImportPlugin:examineMultiseries')
     loadables = []
@@ -114,7 +126,121 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
 
     return loadables
 
+  def examineFilesIPPAcqTime(self,files):
+    """
+    This strategy first orders files into lists, where each list is
+    indexed by ImagePositionPatient (IPP). Next, files within each
+    list are ordered by AcquisitionTime attribute. Finally, loadable
+    frames are indexed by AcquisitionTime, and files within each
+    frame are ordered by IPP.
+    This strategy was required to handle DSC MRI data collected on
+    Siemens, tested with a DSC sequence obtained using software
+    version "syngo MR B15"
+    """
+
+    loadables = []
+    subseriesLists = {}
+    orderedFiles = []
+
+    desc = slicer.dicomDatabase.fileValue(files[0],self.tags['seriesDescription']) # SeriesDescription
+
+    minTime = self.tm2ms(slicer.dicomDatabase.fileValue(files[0],self.tags['AcquisitionTime']))
+    for file in files:
+      ipp = slicer.dicomDatabase.fileValue(file,self.tags['position'])
+      time = self.tm2ms(slicer.dicomDatabase.fileValue(file,self.tags['AcquisitionTime']))
+      if time<minTime:
+        minTime = time
+      if not subseriesLists.has_key(ipp):
+        subseriesLists[ipp] = {}
+      subseriesLists[ipp][time] = file
+
+    nSlicesEqual = True
+    allIPPs = subseriesLists.keys()
+    for ipp in subseriesLists.keys():
+      if len(subseriesLists[allIPPs[0]].keys()) != len(subseriesLists[ipp].keys()):
+        nSlicesEqual = False
+        break
+
+    if nSlicesEqual:
+      nFrames = len(subseriesLists[allIPPs[0]].keys())
+      nSlices = len(allIPPs)
+
+      orderedFiles = [0] * nFrames * nSlices
+
+      frameLabelsStr=""
+      frameFileListStr = ""
+      frameLabelsArray = vtk.vtkDoubleArray()
+
+      ippPositionCnt = 0
+      for ipp in subseriesLists.keys():
+        timesSorted = subseriesLists[ipp].keys()
+        timesSorted.sort()
+        timeCnt = 0
+        for time in timesSorted:
+          orderedFiles[timeCnt*nSlices+ippPositionCnt] = subseriesLists[ipp][time]
+          timeCnt = timeCnt+1
+          if ippPositionCnt == 0:
+            frameLabelsStr = frameLabelsStr+str(time-minTime)+','
+            frameLabelsArray.InsertNextValue(time-minTime)
+        ippPositionCnt = ippPositionCnt+1
+
+      scalarVolumePlugin = slicer.modules.dicomPlugins['DICOMScalarVolumePlugin']()
+      firstFrameTime = 0
+      for f in range(nFrames):
+        frameFileList = orderedFiles[f*nSlices:(f+1)*nSlices]
+        svs = scalarVolumePlugin.examine([frameFileList])
+        if len(svs)==0:
+          print('Failed to parse one of the multivolume frames as scalar volume!')
+          break
+        time = self.tm2ms(slicer.dicomDatabase.fileValue(svs[0].files[0],self.tags['AcquisitionTime']))
+        if f==0:
+            frameLabelsStr = '0,'
+            frameLabelsArray.InsertNextValue(0)
+            firstFrameTime = time
+        else:
+            frameLabelsStr = frameLabelsStr+str(time-firstFrameTime)+','
+            frameLabelsArray.InsertNextValue(time)
+
+      for file in orderedFiles:
+        frameFileListStr = frameFileListStr+str(file)+','
+
+      frameLabelsStr = frameLabelsStr[:-1]
+      frameFileListStr = frameFileListStr[:-1]
+
+      mvNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMultiVolumeNode')
+      mvNode.SetReferenceCount(mvNode.GetReferenceCount()-1)
+      mvNode.SetScene(slicer.mrmlScene)
+      mvNode.SetAttribute("MultiVolume.FrameLabels",frameLabelsStr)
+      mvNode.SetAttribute("MultiVolume.FrameIdentifyingDICOMTagName","AcquisitionTime_via_ImagePositionPatient")
+      mvNode.SetAttribute('MultiVolume.NumberOfFrames',str(nFrames))
+      mvNode.SetAttribute('MultiVolume.FrameIdentifyingDICOMTagUnits',"ms")
+      # keep the files in the order by the detected tag
+      # files are not ordered within the individual frames -- this will be
+      # done by ScalarVolumePlugin later
+      mvNode.SetAttribute('MultiVolume.FrameFileList', frameFileListStr)
+
+      mvNode.SetNumberOfFrames(nFrames)
+      mvNode.SetLabelName("AcquisitionTime")
+      mvNode.SetLabelArray(frameLabelsArray)
+
+      loadable = DICOMLib.DICOMLoadable()
+      loadable.files = orderedFiles
+      loadable.name = desc + ' - as a ' + str(nFrames) + ' frames MultiVolume by IPP+AcquisitionTime'
+      mvNode.SetName(desc)
+      loadable.tooltip = loadable.name
+      loadable.selected = True
+      loadable.multivolume = mvNode
+      loadable.confidence = 0.9
+      loadables.append(loadable)
+
+    return loadables
+
   def examineFiles(self,files):
+
+    """
+    This is the main strategy that assumes all files (instances) belong
+    to the same series, and all instances within the same frame have the same value for one of the attributes defined in self.multiVolumeTags
+    """
 
     logging.debug("MultiVolumeImportPlugin::examine")
 
@@ -438,9 +564,6 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
         else:
           frameLabelsArray.InsertNextValue(tagValue)
           frameLabelsStr = frameLabelsStr+str(tagValue)+','
-
-      #print 'File list: ',frameFileList
-      #print 'Labels: ',frameLabelsStr
 
       frameFileListStr = frameFileListStr[:-1]
       frameLabelsStr = frameLabelsStr[:-1]
