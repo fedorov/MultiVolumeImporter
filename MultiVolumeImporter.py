@@ -209,11 +209,18 @@ class MultiVolumeImporterWidget:
       print('Single frame dataset - not reading as multivolume!')
       return
 
+    # convert seconds data to milliseconds, which is expected by pkModeling.cxx line 81
+    if dicomTagUnitsAttr == 's':
+      frameIdMultiplier = 1000.0
+      dicomTagUnitsAttr = 'ms'
+    else:
+      frameIdMultiplier = 1.0
+
     volumeLabels.SetNumberOfTuples(nFrames)
     volumeLabels.SetNumberOfComponents(1)
     volumeLabels.Allocate(nFrames)
     for i in range(nFrames):
-      frameId = self.__veInitial.value+self.__veStep.value*i
+      frameId = frameIdMultiplier*(self.__veInitial.value+self.__veStep.value*i)
       volumeLabels.SetComponent(i, 0, frameId)
       frameLabelsAttr += str(frameId)+','
     frameLabelsAttr = frameLabelsAttr[:-1]
@@ -267,12 +274,12 @@ class MultiVolumeImporterWidget:
     mvNode.SetAttribute('MultiVolume.FrameIdentifyingDICOMTagUnits',dicomTagUnitsAttr)
 
     if dicomTagNameAttr == 'TriggerTime' or dicomTagNameAttr == 'AcquisitionTime':
-      if teTag != '':
-        mvNode.SetAttribute('MultiVolume.DICOM.EchoTime',teTag)
-      if trTag != '':
-        mvNode.SetAttribute('MultiVolume.DICOM.RepetitionTime',trTag)
-      if faTag != '':
-        mvNode.SetAttribute('MultiVolume.DICOM.FlipAngle',faTag)
+      if teAttr != '':
+        mvNode.SetAttribute('MultiVolume.DICOM.EchoTime',teAttr)
+      if trAttr != '':
+        mvNode.SetAttribute('MultiVolume.DICOM.RepetitionTime',trAttr)
+      if faAttr != '':
+        mvNode.SetAttribute('MultiVolume.DICOM.FlipAngle',faAttr)
 
     mvNode.SetName(str(nFrames)+' frames MultiVolume')
     Helper.SetBgFgVolumes(mvNode.GetID(),None)
