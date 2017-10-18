@@ -67,6 +67,24 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     self.multiVolumeTagsUnits['Standard.B-value'] = "sec/mm2"
     self.epsilon = epsilon
 
+  @staticmethod
+  def settingsPanelEntry(panel, parent):
+    """Create a settings panel entry for this plugin class.
+    It is added to the DICOM panel of the application settings
+    by the DICOM module.
+    """
+
+    formLayout = qt.QFormLayout(parent)
+    importFormatsComboBox = ctk.ctkComboBox()
+    importFormatsComboBox.toolTip = "Preferred format for imported volume sequences. It determines what MRML node type volume sequences will be loaded into."
+    importFormatsComboBox.addItem("default (multi-volume)", "default")
+    importFormatsComboBox.addItem("volume sequence", "sequence")
+    importFormatsComboBox.addItem("multi-volume", "multivolume") 
+    importFormatsComboBox.currentIndex = 0
+    formLayout.addRow("Preferred multi-volume import format:", importFormatsComboBox)
+    panel.registerProperty(
+      "DICOM/PreferredMultiVolumeImportFormat", importFormatsComboBox, "currentUserDataAsString", qt.SIGNAL("currentIndexChanged (int)"))
+
   def examine(self,fileLists):
     """ Returns a list of DICOMLoadable instances
     corresponding to ways of interpreting the
@@ -87,13 +105,47 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     # here all files are lumped into one list for the situations when
     # individual frames should be parsed from series
     loadables += self.examineFilesMultiseries(allfiles)
-    loadables += self.examineFilesIPPAcqTime(allfiles)
+    if len(allfiles)>len(files):
+      # only examineFilesIPPAcqTime again if there are multiple file groups
+      loadables += self.examineFilesIPPAcqTime(allfiles)
 
     # this strategy sorts the files into groups
     loadables += self.examineFilesIPPInstanceNumber(allfiles)
 
-    return loadables
+    # If Sequences module is available then duplicate all the loadables
+    # for loading them as volume sequence.
+    # A slightly higher confidence value is set for volume sequence loadables,
+    # therefore by default data will be loaded as volume sequence.
 
+    if hasattr(slicer.modules, 'sequences'):
+
+      seqLoadables = []
+      for loadable in loadables:
+        seqLoadable = DICOMLib.DICOMLoadable()
+        seqLoadable.files = loadable.files
+        seqLoadable.tooltip = loadable.tooltip.replace(' frames MultiVolume by ', ' frames Volume Sequence by ')
+        seqLoadable.name = loadable.tooltip.replace(' frames MultiVolume by ', ' frames Volume Sequence by ')
+        seqLoadable.multivolume = loadable.multivolume
+        seqLoadable.selected = loadable.selected
+
+        seqLoadable.confidence = loadable.confidence
+
+        seqLoadable.loadAsVolumeSequence = True
+        seqLoadables.append(seqLoadable)
+
+      # Among all selected loadables, the ones that are listed first will be selected by default,
+      # therefore we need to prepend loadables if sequence format is preferred.
+      # Determine from settings loading into sequence node should have higher confidence (selected by default).
+      settings = qt.QSettings()
+      sequenceFormatPreferred = (settings.value("DICOM/PreferredMultiVolumeImportFormat", "default") == "sequence")
+      if sequenceFormatPreferred:
+       # prepend
+       loadables[0:0] = seqLoadables
+      else:
+       # append
+       loadables += seqLoadables
+
+    return loadables
 
   def examineFilesMultiseries(self,files):
     """
@@ -503,8 +555,15 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     filesPerFrame = nFiles/nFrames
     frames = []
 
-    mvImage = vtk.vtkImageData()
-    mvImageArray = None
+    loadAsVolumeSequence = hasattr(loadable, 'loadAsVolumeSequence') and loadable.loadAsVolumeSequence
+    if loadAsVolumeSequence:
+      volumeSequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode",
+        slicer.mrmlScene.GenerateUniqueName(mvNode.GetName()))
+      volumeSequenceNode.SetIndexName("")
+      volumeSequenceNode.SetIndexUnit("")
+    else:
+      mvImage = vtk.vtkImageData()
+      mvImageArray = None
 
     scalarVolumePlugin = slicer.modules.dicomPlugins['DICOMScalarVolumePlugin']()
     instanceUIDs = ""
@@ -516,75 +575,147 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     instanceUIDs = instanceUIDs[:-1]
     mvNode.SetAttribute("DICOM.instanceUIDs", instanceUIDs)
 
-    # read each frame into scalar volume
-    for frameNumber in range(nFrames):
+    progressbar = slicer.util.createProgressDialog(labelText="Loading "+mvNode.GetName(),
+                                                   value=0, maximum=nFrames,
+                                                   windowModality = qt.Qt.WindowModal)
 
-      sNode = slicer.vtkMRMLVolumeArchetypeStorageNode()
-      sNode.ResetFileNameList();
+    try:
+      # read each frame into scalar volume
+      for frameNumber in range(nFrames):
 
-      frameFileList = files[frameNumber*filesPerFrame:(frameNumber+1)*filesPerFrame]
-      # sv plugin will sort the filenames by geometric order
-      svLoadables = scalarVolumePlugin.examine([frameFileList])
+        progressbar.value = frameNumber
+        slicer.app.processEvents()
+        if progressbar.wasCanceled:
+          break
 
-      if len(svLoadables) == 0:
-        return None
+        sNode = slicer.vtkMRMLVolumeArchetypeStorageNode()
+        sNode.ResetFileNameList();
 
-      frame = scalarVolumePlugin.load(svLoadables[0])
+        frameFileList = files[frameNumber*filesPerFrame:(frameNumber+1)*filesPerFrame]
+        # sv plugin will sort the filenames by geometric order
+        svLoadables = scalarVolumePlugin.examine([frameFileList])
 
-      if frame.GetImageData() == None:
-        logging.error('Failed to read a multivolume frame!')
-        return None
+        if len(svLoadables) == 0:
+          raise IOError("volume frame %d is invalid" % frameNumber)
 
-      if frameNumber == 0:
-        frameImage = frame.GetImageData()
-        frameExtent = frameImage.GetExtent()
-        frameSize = frameExtent[1]*frameExtent[3]*frameExtent[5]
+        frame = scalarVolumePlugin.load(svLoadables[0])
 
-        mvImage.SetExtent(frameExtent)
-        if vtk.VTK_MAJOR_VERSION <= 5:
-          mvImage.SetNumberOfScalarComponents(nFrames)
-          mvImage.SetScalarType(frame.GetImageData().GetScalarType())
-          mvImage.AllocateScalars()
+        if frame.GetImageData() == None:
+          raise IOError("volume frame %d is invalid" % frameNumber)
+        if loadAsVolumeSequence:
+          # Load into volume sequence
+
+          # volumeSequenceNode.SetDataNodeAtValue would deep-copy the volume frame.
+          # To avoid memory reallocation, add an empty node and shallow-copy the contents
+          # of the volume frame.
+
+          # Create an empty volume node in the sequence node
+          proxyVolume = slicer.mrmlScene.AddNewNodeByClass(frame.GetClassName())
+          indexValue = str(frameNumber)
+          volumeSequenceNode.SetDataNodeAtValue(proxyVolume, indexValue)
+          slicer.mrmlScene.RemoveNode(proxyVolume)
+
+          # Update the data node
+          shallowCopy = True
+          volumeSequenceNode.UpdateDataNodeAtValue(frame, indexValue, shallowCopy)
+
         else:
-          mvImage.AllocateScalars(frame.GetImageData().GetScalarType(), nFrames)
+          # Load into multi-volume
 
-        mvImageArray = vtk.util.numpy_support.vtk_to_numpy(mvImage.GetPointData().GetScalars())
+          if frameNumber == 0:
+            frameImage = frame.GetImageData()
+            frameExtent = frameImage.GetExtent()
+            frameSize = frameExtent[1]*frameExtent[3]*frameExtent[5]
 
-        mvNode.SetScene(slicer.mrmlScene)
+            mvImage.SetExtent(frameExtent)
+            if vtk.VTK_MAJOR_VERSION <= 5:
+              mvImage.SetNumberOfScalarComponents(nFrames)
+              mvImage.SetScalarType(frame.GetImageData().GetScalarType())
+              mvImage.AllocateScalars()
+            else:
+              mvImage.AllocateScalars(frame.GetImageData().GetScalarType(), nFrames)
 
-        mat = vtk.vtkMatrix4x4()
-        frame.GetRASToIJKMatrix(mat)
-        mvNode.SetRASToIJKMatrix(mat)
-        frame.GetIJKToRASMatrix(mat)
-        mvNode.SetIJKToRASMatrix(mat)
+            mvImageArray = vtk.util.numpy_support.vtk_to_numpy(mvImage.GetPointData().GetScalars())
 
-      frameImage = frame.GetImageData()
-      frameImageArray = vtk.util.numpy_support.vtk_to_numpy(frameImage.GetPointData().GetScalars())
+            mvNode.SetScene(slicer.mrmlScene)
 
-      mvImageArray.T[frameNumber] = frameImageArray
+            mat = vtk.vtkMatrix4x4()
+            frame.GetRASToIJKMatrix(mat)
+            mvNode.SetRASToIJKMatrix(mat)
+            frame.GetIJKToRASMatrix(mat)
+            mvNode.SetIJKToRASMatrix(mat)
 
-    mvDisplayNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMultiVolumeDisplayNode')
-    mvDisplayNode.SetReferenceCount(mvDisplayNode.GetReferenceCount()-1)
-    mvDisplayNode.SetScene(slicer.mrmlScene)
-    mvDisplayNode.SetDefaultColorMap()
-    slicer.mrmlScene.AddNode(mvDisplayNode)
+          frameImage = frame.GetImageData()
+          frameImageArray = vtk.util.numpy_support.vtk_to_numpy(frameImage.GetPointData().GetScalars())
 
-    mvNode.SetAndObserveDisplayNodeID(mvDisplayNode.GetID())
-    mvNode.SetAndObserveImageData(mvImage)
-    mvNode.SetNumberOfFrames(nFrames)
-    mvNode.SetName(loadable.name)
-    slicer.mrmlScene.AddNode(mvNode)
+          mvImageArray.T[frameNumber] = frameImageArray
 
-    #
-    # automatically select the volume to display
-    #
-    appLogic = slicer.app.applicationLogic()
-    selNode = appLogic.GetSelectionNode()
-    selNode.SetReferenceActiveVolumeID(mvNode.GetID())
-    appLogic.PropagateVolumeSelection()
+        # Remove temporary volume node
+        if frame.GetDisplayNode():
+          slicer.mrmlScene.RemoveNode(frame.GetDisplayNode())
+        if frame.GetStorageNode():
+          slicer.mrmlScene.RemoveNode(frame.GetStorageNode())
+        slicer.mrmlScene.RemoveNode(frame)
 
-    # file list is no longer needed - remove the attribute
-    mvNode.RemoveAttribute('MultiVolume.FrameFileList')
+      if loadAsVolumeSequence:
+        # Finalize volume sequence import
+        # For user convenience, add a browser node and show the volume in the slice viewer.
+
+        # Add browser node
+        sequenceBrowserNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode',
+          slicer.mrmlScene.GenerateUniqueName(mvNode.GetName() + " browser"))
+        sequenceBrowserNode.SetAndObserveMasterSequenceNodeID(volumeSequenceNode.GetID())
+        # If save changes are allowed then proxy nodes are updated using shallow copy, which is much
+        # faster for images. Images are usually not modified, so the risk of accidentally modifying
+        # data in the sequence is low.
+        sequenceBrowserNode.SetSaveChanges(volumeSequenceNode, True)
+        # Show frame number in proxy volume node name
+        sequenceBrowserNode.SetOverwriteProxyName(volumeSequenceNode, True);
+
+        # Automatically select the volume to display
+        imageProxyVolumeNode = sequenceBrowserNode.GetProxyNode(volumeSequenceNode)
+        appLogic = slicer.app.applicationLogic()
+        selNode = appLogic.GetSelectionNode()
+        selNode.SetReferenceActiveVolumeID(imageProxyVolumeNode.GetID())
+        appLogic.PropagateVolumeSelection()
+
+        # Show sequence browser toolbar
+        sequenceBrowserModule = slicer.modules.sequencebrowser
+        if sequenceBrowserModule.autoShowToolBar:
+          sequenceBrowserModule.setToolBarActiveBrowserNode(sequenceBrowserNode)
+          sequenceBrowserModule.setToolBarVisible(True)
+
+      else:
+        # Finalize multi-volume import
+
+        mvDisplayNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMultiVolumeDisplayNode')
+        mvDisplayNode.SetDefaultColorMap()
+
+        mvNode.SetAndObserveDisplayNodeID(mvDisplayNode.GetID())
+        mvNode.SetAndObserveImageData(mvImage)
+        mvNode.SetNumberOfFrames(nFrames)
+        mvNode.SetName(loadable.name)
+        slicer.mrmlScene.AddNode(mvNode)
+
+        #
+        # automatically select the volume to display
+        #
+        appLogic = slicer.app.applicationLogic()
+        selNode = appLogic.GetSelectionNode()
+        selNode.SetReferenceActiveVolumeID(mvNode.GetID())
+        appLogic.PropagateVolumeSelection()
+
+        # file list is no longer needed - remove the attribute
+        mvNode.RemoveAttribute('MultiVolume.FrameFileList')
+
+    except Exception as e:
+      logging.error("Failed to read a multivolume: {0}".format(e.message))
+      import traceback
+      traceback.print_exc()
+      mvNode = None
+
+    finally:
+      progressbar.close()
 
     return mvNode
 
@@ -714,8 +845,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       frameLabelsStr = frameLabelsStr[:-1]
 
       mvNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMultiVolumeNode')
-      mvNode.SetReferenceCount(mvNode.GetReferenceCount()-1)
-      mvNode.SetScene(slicer.mrmlScene)
+      mvNode.UnRegister(None)
       mvNode.SetAttribute("MultiVolume.FrameLabels",frameLabelsStr)
       mvNode.SetAttribute("MultiVolume.FrameIdentifyingDICOMTagName",frameTag)
       mvNode.SetAttribute('MultiVolume.NumberOfFrames',str(len(tagValue2FileList)))
