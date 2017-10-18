@@ -766,8 +766,8 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
           tag2ValueFileList[frameTag] = tagValue2FileList
 
         tagValueStr = slicer.dicomDatabase.fileValue(file,self.tags[frameTag])
-        if tagValueStr == '':
-          # not found?
+        if tagValueStr == '__TAG_NOT_IN_INSTANCE__' or tagValueStr == '':
+          # not found
           continue
 
         if frameTag == 'AcquisitionTime' or frameTag == 'SeriesTime' or frameTag == 'ContentTime':
