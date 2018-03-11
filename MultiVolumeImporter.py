@@ -2,6 +2,8 @@ from __future__ import print_function
 import sys, re, os
 
 from __main__ import vtk, qt, ctk, slicer
+from slicer.ScriptedLoadableModule import *
+
 try:
   NUMPY_AVAILABLE = True
   import vtk.util.numpy_support
@@ -13,8 +15,9 @@ from MultiVolumeImporterLib.Helper import Helper
 # MultiVolumeImporter
 #
 
-class MultiVolumeImporter:
+class MultiVolumeImporter(ScriptedLoadableModule):
   def __init__(self, parent):
+    ScriptedLoadableModule.__init__(self, parent)
     parent.title = "MultiVolumeImporter"
     parent.categories = ["MultiVolume Support"]
     parent.contributors = ["Andrey Fedorov (SPL, BWH)",\
@@ -27,6 +30,7 @@ class MultiVolumeImporter:
     parent.helpText = """
     Support of MultiVolume import in Slicer4
     """
+    parent.helpText += self.getDefaultModuleDocumentationLink()
     # MultiVolumeExplorer registers the MRML node type this module is using
     parent.dependencies = ['MultiVolumeExplorer']
     parent.acknowledgementText = """
@@ -39,20 +43,10 @@ class MultiVolumeImporter:
 # qMultiVolumeImporterWidget
 #
 
-class MultiVolumeImporterWidget:
-  def __init__(self, parent = None):
-    if not parent:
-      self.parent = slicer.qMRMLWidget()
-      self.parent.setLayout(qt.QVBoxLayout())
-      self.parent.setMRMLScene(slicer.mrmlScene)
-    else:
-      self.parent = parent
-    self.layout = self.parent.layout()
-    if not parent:
-      self.setup()
-      self.parent.show()
+class MultiVolumeImporterWidget(ScriptedLoadableModuleWidget):
 
   def setup(self):
+    ScriptedLoadableModuleWidget.setup(self)
     # Instantiate and connect widgets ...
 
     if not NUMPY_AVAILABLE:
@@ -147,11 +141,11 @@ class MultiVolumeImporterWidget:
     return
 
   def humanSort(self,l):
-    """ Sort the given list in the way that humans expect. 
+    """ Sort the given list in the way that humans expect.
         Conributed by Yanling Liu
-    """ 
-    convert = lambda text: int(text) if text.isdigit() else text 
-    alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', key) ] 
+    """
+    convert = lambda text: int(text) if text.isdigit() else text
+    alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', key) ]
     l.sort( key=alphanum_key )
 
   def onImportButtonClicked(self):
@@ -188,6 +182,16 @@ class MultiVolumeImporterWidget:
         fileNames.append(fileName)
     self.humanSort(fileNames)
 
+    # check for nifti file that may be 4D as special case
+    niftiFiles = []
+    for fileName in fileNames:
+      if fileName.lower().endswith('.nii.gz') or fileName.lower().endswith('.nii'):
+        niftiFiles.append(fileName)
+    if len(niftiFiles) == 1:
+     self.read4DNIfTI(mvNode, niftiFiles[0])
+     return
+
+    # not 4D nifti, so keep trying
     for fileName in fileNames:
       (s,f) = self.readFrame(fileName)
       if s:
@@ -238,7 +242,7 @@ class MultiVolumeImporterWidget:
     extent = frame0.GetImageData().GetExtent()
     numPixels = float(extent[1]+1)*(extent[3]+1)*(extent[5]+1)*nFrames
     scalarType = frame0.GetImageData().GetScalarType()
-    print('Will now try to allocate memory for '+str(numPixels)+' pixels of VTK scalar type'+str(scalarType))
+    print('Will now try to allocate memory for '+str(numPixels)+' pixels of VTK scalar type '+str(scalarType))
     print('Memory allocated successfully')
     mvImageArray = vtk.util.numpy_support.vtk_to_numpy(mvImage.GetPointData().GetScalars())
 
@@ -303,3 +307,92 @@ class MultiVolumeImporterWidget:
     slicer.mrmlScene.RemoveNode(sn)
     slicer.mrmlScene.RemoveNode(node)
 
+  def read4DNIfTI(self, mvNode, fileName):
+    """Try to read a 4D nifti file as a multivolume"""
+    print('trying to read %s' % fileName)
+
+    # use the vtk reader which seems to handle most nifti variants well
+    reader = vtk.vtkNIFTIImageReader()
+    reader.SetFileName(fileName)
+    reader.SetTimeAsVector(True)
+    reader.Update()
+    header = reader.GetNIFTIHeader()
+    qFormMatrix = reader.GetQFormMatrix()
+    if not qFormMatrix:
+      print('Warning: %s does not have a QFormMatrix - using Identity')
+      qFormMatrix = vtk.vtkMatrix4x4()
+    spacing = reader.GetOutputDataObject(0).GetSpacing()
+    timeSpacing = reader.GetTimeSpacing()
+    nFrames = reader.GetTimeDimension()
+    if header.GetIntentCode() != header.IntentTimeSeries:
+      intentName = header.GetIntentName()
+      if not intentName:
+        intentName = 'Nothing'
+      print('Warning: %s does not have TimeSeries intent, instead it has \"%s\"' % (fileName,intentName))
+      print('Trying to read as TimeSeries anyway')
+    units = header.GetXYZTUnits()
+
+    # try to account for some of the unit options
+    # (Note: no test data available but we hope these are right)
+    if units & header.UnitsMSec:
+      timeSpacing /= 1000.
+    if units & header.UnitsUSec:
+      timeSpacing /= 1000. / 1000.
+    spaceScaling = 1.
+    if units & header.UnitsMeter:
+      spaceScaling *= 1000.
+    if units & header.UnitsMicron:
+      spaceScaling /= 1000.
+    spacing = map(lambda e: e * spaceScaling, spacing)
+
+    # create frame labels using the timing info from the file
+    # but use the advanced info so user can specify offset and scale
+    volumeLabels = vtk.vtkDoubleArray()
+    frameLabelsAttr = ''
+    volumeLabels.SetNumberOfTuples(nFrames)
+    volumeLabels.SetNumberOfComponents(1)
+    volumeLabels.Allocate(nFrames)
+    for i in range(nFrames):
+      frameId = self.__veInitial.value + timeSpacing * self.__veStep.value * i
+      volumeLabels.SetComponent(i, 0, frameId)
+      frameLabelsAttr += str(frameId)+','
+    frameLabelsAttr = frameLabelsAttr[:-1]
+
+    # create the display node
+    mvDisplayNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMultiVolumeDisplayNode')
+    mvDisplayNode.SetScene(slicer.mrmlScene)
+    slicer.mrmlScene.AddNode(mvDisplayNode)
+    mvDisplayNode.SetReferenceCount(mvDisplayNode.GetReferenceCount()-1)
+    mvDisplayNode.SetDefaultColorMap()
+
+    # spacing and origin are in the ijkToRAS, so clear them from image data
+    imageChangeInformation = vtk.vtkImageChangeInformation()
+    imageChangeInformation.SetInputConnection(reader.GetOutputPort())
+    imageChangeInformation.SetOutputSpacing( 1, 1, 1 )
+    imageChangeInformation.SetOutputOrigin( 0, 0, 0 )
+    imageChangeInformation.Update()
+
+    # QForm includes directions and origin, but not spacing so add that
+    # here by multiplying by a diagonal matrix with the spacing
+    scaleMatrix = vtk.vtkMatrix4x4()
+    for diag in range(3):
+      scaleMatrix.SetElement(diag, diag, spacing[diag])
+    ijkToRAS = vtk.vtkMatrix4x4()
+    ijkToRAS.DeepCopy(qFormMatrix)
+    vtk.vtkMatrix4x4.Multiply4x4(ijkToRAS, scaleMatrix, ijkToRAS)
+    mvNode.SetIJKToRASMatrix(ijkToRAS)
+    mvNode.SetAndObserveDisplayNodeID(mvDisplayNode.GetID())
+    mvNode.SetAndObserveImageData(imageChangeInformation.GetOutputDataObject(0))
+    mvNode.SetNumberOfFrames(nFrames)
+
+    # set the labels and other attributes, then display the volume
+    mvNode.SetLabelArray(volumeLabels)
+    mvNode.SetLabelName(self.__veLabel.text)
+
+    mvNode.SetAttribute('MultiVolume.FrameLabels',frameLabelsAttr)
+    mvNode.SetAttribute('MultiVolume.NumberOfFrames',str(nFrames))
+    mvNode.SetAttribute('MultiVolume.FrameIdentifyingDICOMTagName','')
+    mvNode.SetAttribute('MultiVolume.FrameIdentifyingDICOMTagUnits','')
+
+    mvNode.SetName(str(nFrames)+' frames NIfTI MultiVolume')
+    Helper.SetBgFgVolumes(mvNode.GetID(),None)
