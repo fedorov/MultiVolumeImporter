@@ -1,5 +1,5 @@
+from __future__ import print_function
 import os
-import string
 import re
 import vtk, qt, ctk, slicer
 import vtk.util.numpy_support
@@ -54,7 +54,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     self.multiVolumeTags['Philips.B-value'] = "2001,1003"
     self.multiVolumeTags['Standard.B-value'] = "0018,9087"
 
-    for tagName,tagVal in self.multiVolumeTags.iteritems():
+    for tagName,tagVal in self.multiVolumeTags.items():
       self.tags[tagName] = tagVal
 
     self.multiVolumeTagsUnits = {}
@@ -172,7 +172,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
     for mvNode in mvNodes:
       tagName = mvNode.GetAttribute('MultiVolume.FrameIdentifyingDICOMTagName')
       nFrames = mvNode.GetNumberOfFrames()
-      orderedFiles = string.split(mvNode.GetAttribute('MultiVolume.FrameFileList'),',')
+      orderedFiles = mvNode.GetAttribute('MultiVolume.FrameFileList').split(',')
 
       desc = slicer.dicomDatabase.fileValue(orderedFiles[0],self.tags['studyDescription']) # SeriesDescription
       num = slicer.dicomDatabase.fileValue(orderedFiles[0],self.tags['seriesNumber'])
@@ -232,12 +232,12 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       time = int(slicer.dicomDatabase.fileValue(file,self.tags['instanceNumber']))
       if time<minTime:
         minTime = time
-      if not subseriesLists.has_key(ipp):
+      if ipp not in subseriesLists:
         subseriesLists[ipp] = {}
       subseriesLists[ipp][time] = file
 
     nSlicesEqual = True
-    allIPPs = subseriesLists.keys()
+    allIPPs = list(subseriesLists.keys())
     for ipp in subseriesLists.keys():
       if len(subseriesLists[allIPPs[0]].keys()) != len(subseriesLists[ipp].keys()):
         nSlicesEqual = False
@@ -258,8 +258,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
 
       ippPositionCnt = 0
       for ipp in subseriesLists.keys():
-        timesSorted = subseriesLists[ipp].keys()
-        timesSorted.sort()
+        timesSorted = sorted(subseriesLists[ipp].keys())
         timeCnt = 0
         for time in timesSorted:
           orderedFiles[timeCnt*nSlices+ippPositionCnt] = subseriesLists[ipp][time]
@@ -346,12 +345,12 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       time = self.tm2ms(slicer.dicomDatabase.fileValue(file,self.tags['AcquisitionTime']))
       if time<minTime:
         minTime = time
-      if not subseriesLists.has_key(ipp):
+      if ipp not in subseriesLists:
         subseriesLists[ipp] = {}
       subseriesLists[ipp][time] = file
 
     nSlicesEqual = True
-    allIPPs = subseriesLists.keys()
+    allIPPs = list(subseriesLists.keys())
     for ipp in subseriesLists.keys():
       if len(subseriesLists[allIPPs[0]].keys()) != len(subseriesLists[ipp].keys()):
         nSlicesEqual = False
@@ -372,8 +371,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
 
       ippPositionCnt = 0
       for ipp in subseriesLists.keys():
-        timesSorted = subseriesLists[ipp].keys()
-        timesSorted.sort()
+        timesSorted = sorted(subseriesLists[ipp].keys())
         timeCnt = 0
         for time in timesSorted:
           orderedFiles[timeCnt*nSlices+ippPositionCnt] = subseriesLists[ipp][time]
@@ -479,7 +477,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       if desc == "":
         desc = "Unknown"
 
-      if not subseriesLists.has_key(value):
+      if value not in subseriesLists:
         subseriesLists[value] = []
       subseriesLists[value].append(file)
       subseriesDescriptions[value] = desc
@@ -497,7 +495,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       for mvNode in mvNodes:
         tagName = mvNode.GetAttribute('MultiVolume.FrameIdentifyingDICOMTagName')
         nFrames = mvNode.GetNumberOfFrames()
-        orderedFiles = string.split(mvNode.GetAttribute('MultiVolume.FrameFileList'),',')
+        orderedFiles = mvNode.GetAttribute('MultiVolume.FrameFileList').split(',')
 
         if self.isFrameOriginConsistent(orderedFiles, mvNode) == False:
           continue
@@ -525,7 +523,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
 
     # sort files for each frame
     nFiles = len(files)
-    filesPerFrame = nFiles/nFrames
+    filesPerFrame = int(nFiles/nFrames)
     frameOrigins = []
 
     scalarVolumePlugin = slicer.modules.dicomPlugins['DICOMScalarVolumePlugin']()
@@ -564,9 +562,9 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       return None
 
     nFrames = int(mvNode.GetAttribute('MultiVolume.NumberOfFrames'))
-    files = string.split(mvNode.GetAttribute('MultiVolume.FrameFileList'),',')
+    files = mvNode.GetAttribute('MultiVolume.FrameFileList').split(',')
     nFiles = len(files)
-    filesPerFrame = nFiles/nFrames
+    filesPerFrame = int(nFiles/nFrames)
     frames = []
 
     baseName = loadable.name
@@ -741,12 +739,12 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
       return 0
 
     try:
-      hhmmss = string.split(tm,'.')[0]
+      hhmmss = tm.split('.')[0]
     except:
       hhmmss = tm
 
     try:
-      ssfrac = float('0.'+string.split(tm,'.')[1])
+      ssfrac = float('0.'+tm.split('.')[1])
     except:
       ssfrac = 0.
 
@@ -834,9 +832,8 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
         # not enough frames for this tag to be a multivolume
         continue
 
-      tagValues = tagValue2FileList.keys()
+      tagValues = sorted(tagValue2FileList.keys())
       # sort the frames
-      tagValues.sort()
       firstFrameSize = len(tagValue2FileList[tagValues[0]])
       frameInvalid = False
       for tagValue in tagValues:
@@ -908,7 +905,7 @@ class MultiVolumeImporterPluginClass(DICOMPlugin):
 # MultiVolumeImporterPlugin
 #
 
-class MultiVolumeImporterPlugin:
+class MultiVolumeImporterPlugin(object):
   """
   This class is the 'hook' for slicer to detect and recognize the plugin
   as a loadable scripted module
@@ -942,7 +939,7 @@ class MultiVolumeImporterPlugin:
 #
 #
 
-class MultiVolumeImporterPluginWidget:
+class MultiVolumeImporterPluginWidget(object):
   def __init__(self, parent = None):
     self.parent = parent
 
